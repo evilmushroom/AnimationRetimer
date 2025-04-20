@@ -1,301 +1,678 @@
+# -*- coding: utf-8 -*-
 bl_info = {
-    "name": "Animation Retimer",
-    "blender": (3, 6, 0),
+    "name": "Animation Retimer (Multi-Object)",
+    "blender": (3, 6, 0), # Or your target Blender version
     "category": "Animation",
-    "description": "Scale animation between markers with stable key merging"
+    "description": "Scale animation between markers for multiple selected objects, preserving key types.",
+    "version": (1, 1, 0), # Added version
+    "author": "Your Name (Modified by AI)", # Optional: Add author info
+    "location": "Dope Sheet > UI Panel > Retime Tools", # Optional: Add location
+    "warning": "", # Optional: Add warnings if any
+    "doc_url": "", # Optional: Link to documentation
+    "tracker_url": "", # Optional: Link to bug tracker
 }
 
 import bpy
 from collections import defaultdict
 import copy  # Import deep copy module
+import time # For performance timing (optional)
 
+# --- Data Storage ---
+# Store original marker positions (scene-wide)
 retimer_data = {
     "original_markers": {},
-    "original_keyframes": {},
     "original_start": 0,
     "original_end": 0,
     "original_segments": [],
-    "_temp_keyframe_data": {}
+    # Store data per object
+    "objects_processed": [], # Keep track of which objects we started retiming
+    "objects_temp_keyframe_data": {}, # {obj_name: {fcurve_key: [(x, y, interp, hl, hr, type), ...], ...}} # Added type
 }
 
-class ANIMATION_RETIMER_OT_AddMarker(bpy.types.Operator):
-    """Add a new retiming marker at the current frame
-    
-    Creates a marker that can be used to control animation timing.
-    These markers define segments that can be stretched or compressed"""
-    bl_idname = "animation_retimer.add_marker"
-    bl_label = "Add Retime Marker"
-    bl_options = {'REGISTER', 'UNDO'}  # Added UNDO support
-
-    def execute(self, context):
-        frame = context.scene.frame_current
-        marker = context.scene.timeline_markers.new(name=f"RT_{frame}", frame=frame)
-        retimer_data["original_markers"][marker.name] = marker.frame
-        return {'FINISHED'}
-
+# --- Utility Functions ---
 def get_ordered_markers(scene):
     """Return markers sorted by frame number"""
+    # Ensure markers exist before trying to access them
+    if not scene or not scene.timeline_markers:
+        return []
     return sorted(
         [m for m in scene.timeline_markers if m.name.startswith("RT_")],
         key=lambda m: m.frame
     )
 
 def find_segment(frame, segments):
-    """Find which segment a frame belongs to"""
+    """Find which segment a frame belongs to. Returns index, 'before', 'after', or None."""
+    if not segments: # Handle case with no segments defined
+        return None
+
     for i, (start, end) in enumerate(segments):
+        # Allow frame to be exactly on the start or end marker
+        # Use a small tolerance for floating point comparisons? Maybe not needed for frame numbers.
         if start <= frame <= end:
-            return i
-    return -1
+            # Special case: if frame is exactly on the end marker of a segment,
+            # and it's NOT the end marker of the *last* segment, associate it with the *next* segment's start.
+            # This helps handle scaling at the marker points more intuitively.
+            # Let's reconsider: Associate with the segment it falls within.
+            # If frame == end, it belongs to segment i. If frame == start of next, it belongs to next.
+             if frame == end and i < len(segments) - 1 and frame == segments[i+1][0]:
+                  # If exactly on the boundary between two segments, associate with the *first* one (i)
+                  return i
+             elif start <= frame <= end:
+                  return i
+
+
+    # Check if frame is before the first marker or after the last marker
+    if frame < segments[0][0]:
+        return 'before'
+    elif frame > segments[-1][1]:
+        return 'after'
+
+    # Should theoretically not be reached if segments cover the range, but acts as fallback
+    return None
+
+
+# --- Operators ---
+
+class ANIMATION_RETIMER_OT_AddMarker(bpy.types.Operator):
+    """Add a new retiming marker at the current frame"""
+    bl_idname = "animation_retimer.add_marker"
+    bl_label = "Add Retime Marker"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if not context.scene:
+             self.report({'ERROR'}, "No active scene found.")
+             return {'CANCELLED'}
+
+        frame = context.scene.frame_current
+        marker_name = f"RT_{frame}"
+        # Avoid duplicate names if marker already exists at this frame
+        i = 1
+        base_name = marker_name
+        while marker_name in context.scene.timeline_markers:
+             marker_name = f"{base_name}_{i}"
+             i += 1
+
+        marker = context.scene.timeline_markers.new(name=marker_name, frame=frame)
+        # Store original position immediately IF retiming is not active
+        if not context.window_manager.retimer_active:
+             if "original_markers" not in retimer_data:
+                 retimer_data["original_markers"] = {}
+             retimer_data["original_markers"][marker.name] = marker.frame
+        self.report({'INFO'}, f"Added marker: {marker.name}")
+        return {'FINISHED'}
+
 
 class ANIMATION_RETIMER_OT_RetimeMarker(bpy.types.Operator):
-    """Start or stop the retiming process
-    
-    When active, allows you to adjust the timing of your animation by moving markers.
-    The animation will update in real-time to preview the changes"""
+    """Start or stop the retiming process"""
     bl_idname = "animation_retimer.retime_marker"
     bl_label = "Toggle Retime"
-    bl_options = {'REGISTER', 'UNDO'}  # Already had UNDO support
+    bl_options = {'REGISTER', 'UNDO'} # UNDO applies to starting/stopping
 
     _timer = None
     _last_marker_positions = {}
-    _temp_keyframe_data = {}
 
-    def store_initial_keyframe_data(self, action):
-        """Store complete initial keyframe data with unique per-axis storage"""
-        self._temp_keyframe_data = {}
-        retimer_data["_temp_keyframe_data"] = {}
+    def store_initial_keyframe_data_for_object(self, obj):
+        """Store complete initial keyframe data for a single object, including type"""
+        if not obj or not obj.animation_data or not obj.animation_data.action:
+            # print(f"Skipping {obj.name}: No animation data or action.") # Less verbose
+            return False # Indicate failure
+
+        action = obj.animation_data.action
+        obj_name = obj.name
+        if "objects_temp_keyframe_data" not in retimer_data:
+            retimer_data["objects_temp_keyframe_data"] = {}
+        retimer_data["objects_temp_keyframe_data"][obj_name] = {} # Ensure object entry exists
+
+        # print(f"Storing initial keyframes for: {obj_name}") # Less verbose
+        count = 0
+        for fcurve in action.fcurves:
+            key = (fcurve.data_path, fcurve.array_index) # Unique key: (data_path, array_index)
+            # Store x, y, interpolation, handles (deep copied), and type
+            keyframe_data = [
+                (kp.co.x, kp.co.y, kp.interpolation, copy.deepcopy(kp.handle_left), copy.deepcopy(kp.handle_right), kp.type)
+                for kp in fcurve.keyframe_points
+            ]
+            retimer_data["objects_temp_keyframe_data"][obj_name][key] = keyframe_data
+            count += len(keyframe_data)
+
+        # print(f"Stored {count} keyframes across {len(action.fcurves)} F-Curves for {obj_name}.") # Less verbose
+        return True # Indicate success
+
+    def restore_from_original_for_object(self, obj):
+        """Restore keyframes for a single object from stored data, including type. Used by Cancel."""
+        obj_name = obj.name
+        if not obj or not obj.animation_data or not obj.animation_data.action:
+            # print(f"Cannot restore for {obj_name}: Missing object or animation data.") # Less verbose
+            return
+        if "objects_temp_keyframe_data" not in retimer_data or \
+           obj_name not in retimer_data["objects_temp_keyframe_data"]:
+             # print(f"Warning: No stored keyframe data found for {obj_name}. Skipping restore.") # Less verbose
+             return
+
+        action = obj.animation_data.action
+        stored_fcurve_data = retimer_data["objects_temp_keyframe_data"][obj_name]
+        # print(f"Restoring keyframes for: {obj_name}") # Less verbose
 
         for fcurve in action.fcurves:
             key = (fcurve.data_path, fcurve.array_index)
-            keyframe_data = [
-                (kp.co.x, kp.co.y, kp.interpolation, copy.deepcopy(kp.handle_left), copy.deepcopy(kp.handle_right))
-                for kp in fcurve.keyframe_points
-            ]
-            self._temp_keyframe_data[key] = keyframe_data
-            retimer_data["_temp_keyframe_data"][key] = keyframe_data
+            if key not in stored_fcurve_data:
+                continue
 
-        print("Stored keyframe data:", self._temp_keyframe_data)
+            # --- Clear existing keyframes ---
+            try:
+                # Faster way to clear? No direct 'clear' method. Removing one by one is standard.
+                while len(fcurve.keyframe_points) > 0:
+                    fcurve.keyframe_points.remove(fcurve.keyframe_points[0], fast=True)
+            except ReferenceError:
+                print(f"Warning: Could not clear keyframes for {key} in {obj_name} (possible internal Blender issue). Skipping F-Curve.")
+                continue
 
-    def restore_from_original(self, action):
-        """Restore keyframes from original data safely per F-Curve with axis awareness"""
-        for fcurve in action.fcurves:
-            key = (fcurve.data_path, fcurve.array_index)  # Use unique key
-            
-            if key not in self._temp_keyframe_data:
-                print(f"Warning: Missing original keyframe data for {key}. Skipping...")
-                continue  # Skip missing F-Curve instead of crashing
-            
-            # Remove all current keyframes
-            while len(fcurve.keyframe_points) > 0:
-                fcurve.keyframe_points.remove(fcurve.keyframe_points[0])
-            
-            # Add back original keyframes
-            for x, y, interp, hl, hr in self._temp_keyframe_data[key]:
-                kp = fcurve.keyframe_points.insert(x, y)
-                kp.interpolation = interp
-                kp.handle_left = copy.deepcopy(hl)
-                kp.handle_right = copy.deepcopy(hr)
-            
+            # --- Add back original keyframes ---
+            original_keys = stored_fcurve_data[key]
+            if not original_keys:
+                 continue
+
+            # Data should be sorted by x already, but sorting doesn't hurt
+            sorted_keys = sorted(original_keys, key=lambda k: k[0])
+            for x, y, interp, hl, hr, k_type in sorted_keys: # Unpack type
+                try:
+                    kp = fcurve.keyframe_points.insert(x, y, options={'NEEDED', 'FAST'})
+                    kp.interpolation = interp
+                    # Use deepcopy *again* when restoring handles
+                    kp.handle_left = copy.deepcopy(hl)
+                    kp.handle_right = copy.deepcopy(hr)
+                    kp.type = k_type # Restore the keyframe type
+                except Exception as e:
+                    print(f"Error inserting keyframe at {x} for {key} in {obj_name}: {e}")
+
             fcurve.update()
 
     def process_retiming(self, context):
+        """Apply retiming logic to all tracked objects based on marker changes"""
+        #perf_start_time = time.time() # Optional: for performance measurement
         wm = context.window_manager
-        obj = context.object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            return
+        scene = context.scene
+        if not scene: return # Scene closed?
 
-        markers = get_ordered_markers(context.scene)
-        if len(markers) < 2:
-            return
+        # --- 1. Check if Markers Changed ---
+        markers = get_ordered_markers(scene)
+        if len(markers) < 2: return
 
-        # Get marker positions
         current_positions = {m.name: m.frame for m in markers}
-
-        if current_positions == self._last_marker_positions:
-            return
+        if not hasattr(self, '_last_marker_positions'): self._last_marker_positions = {}
+        if current_positions == self._last_marker_positions: return # No change
 
         self._last_marker_positions = current_positions.copy()
 
-        # Sort markers to ensure order
-        original_markers = sorted(
-            [(name, retimer_data["original_markers"][name]) for name in retimer_data["original_markers"]],
-            key=lambda x: x[1]
-        )
+        # --- 2. Recalculate Segment Mappings ---
+        original_marker_positions = retimer_data.get("original_markers", {})
+        if not original_marker_positions: return # Should not happen if started correctly
 
-        # Create segment mappings
+        valid_current_markers = {name: marker for name, marker in zip(current_positions.keys(), markers) if name in original_marker_positions}
+        if len(valid_current_markers) < 2: return
+
+        sorted_marker_names = sorted(valid_current_markers.keys(), key=lambda name: original_marker_positions[name])
+
         original_segments = []
         current_segments = []
-        for i in range(len(markers) - 1):
-            orig_start, orig_end = original_markers[i][1], original_markers[i + 1][1]
-            curr_start, curr_end = markers[i].frame, markers[i + 1].frame
+        for i in range(len(sorted_marker_names) - 1):
+            name1, name2 = sorted_marker_names[i], sorted_marker_names[i+1]
+            if name1 not in current_positions or name2 not in current_positions: continue
+
+            orig_start = original_marker_positions[name1]
+            orig_end = original_marker_positions[name2]
+            curr_start = current_positions[name1]
+            curr_end = current_positions[name2]
 
             original_segments.append((orig_start, orig_end))
             current_segments.append((curr_start, curr_end))
 
-        # Edge Case Handling: Check for marker inversion
-        for i in range(len(markers) - 1):
-            curr_start, curr_end = markers[i].frame, markers[i + 1].frame
-            if curr_start >= curr_end:
-                self.report({'INFO'}, "Segment collapsed - animation will be compressed")
-                # Remove return statement to allow processing to continue
+        # --- 3. Process Each Object ---
+        objects_to_retime = retimer_data.get("objects_processed", [])
+        if not objects_to_retime: return
 
-        action = obj.animation_data.action
-        self.restore_from_original(action)  # Ensure we're modifying original keyframes
+        snap_frames = wm.retimer_snap_frames # Cache property lookup
 
-        # Adjust keyframes based on marker positions
-        for fcurve in action.fcurves:
-            key = (fcurve.data_path, fcurve.array_index)  # Use the correct key for each axis
-            new_keys = []
-            
-            for orig_x, orig_y, interp, hl, hr in self._temp_keyframe_data[key]:
-                segment_idx = find_segment(orig_x, original_segments)
+        for obj_name in objects_to_retime:
+            obj = bpy.data.objects.get(obj_name)
+            if not obj or not obj.animation_data or not obj.animation_data.action: continue
+            if "objects_temp_keyframe_data" not in retimer_data or \
+               obj_name not in retimer_data["objects_temp_keyframe_data"]: continue
 
-                if segment_idx == -1:
-                    if orig_x < original_segments[0][0]:  # Before first marker
-                        offset = current_segments[0][0] - original_segments[0][0]
-                        new_x = orig_x + offset
-                    else:  # After last marker
-                        offset = current_segments[-1][1] - original_segments[-1][1]
-                        new_x = orig_x + offset
-                else:
-                    # Rescale within segment
-                    orig_start, orig_end = original_segments[segment_idx]
-                    curr_start, curr_end = current_segments[segment_idx]
+            action = obj.animation_data.action
+            stored_fcurve_data = retimer_data["objects_temp_keyframe_data"][obj_name]
 
-                    # Prevent division by zero
-                    orig_length = max(orig_end - orig_start, 0.001)
-                    curr_length = max(curr_end - curr_start, 0.001)
-                    
-                    # Calculate position proportionally
-                    position_in_segment = (orig_x - orig_start) / orig_length
-                    new_x = curr_start + (position_in_segment * curr_length)
+            # --- OPTIMIZATION: Remove restore_from_original call here ---
+            # self.restore_from_original_for_object(obj) # REMOVED!
 
-                if wm.retimer_snap_frames:
-                    new_x = round(new_x)
-
-                new_keys.append((new_x, orig_y, interp, hl, hr))
-
-            # Apply updated keyframes
-            fcurve.keyframe_points.clear()
-            for x, y, interp, hl, hr in sorted(new_keys, key=lambda k: k[0]):
-                kp = fcurve.keyframe_points.insert(x, y)
-                kp.interpolation = interp
-                kp.handle_left = hl
-                kp.handle_right = hr
-            
-            fcurve.update()
-
-        # Fix: Prevent excessive merging of keyframes
-        if wm.retimer_snap_frames:
             for fcurve in action.fcurves:
-                seen_frames = {}
-                to_remove = []
+                key = (fcurve.data_path, fcurve.array_index)
+                if key not in stored_fcurve_data: continue
 
-                for idx, kp in enumerate(fcurve.keyframe_points):
-                    frame = round(kp.co.x)
-                    if frame in seen_frames:
-                        # Instead of averaging, keep only one key per frame
-                        to_remove.append(idx)
-                    else:
-                        seen_frames[frame] = kp
+                original_keys_for_fcurve = stored_fcurve_data[key]
+                if not original_keys_for_fcurve:
+                    # If original was empty, ensure current is also empty
+                    if len(fcurve.keyframe_points) > 0:
+                         try:
+                              while len(fcurve.keyframe_points) > 0:
+                                   fcurve.keyframe_points.remove(fcurve.keyframe_points[0], fast=True)
+                              fcurve.update()
+                         except ReferenceError: pass # Ignore if clearing fails
+                    continue # Skip to next fcurve
 
-                for idx in reversed(to_remove):
-                    fcurve.keyframe_points.remove(fcurve.keyframe_points[idx])
+                # --- Calculate New X Positions ---
+                calculated_new_keys = [] # List of (new_x, y, interp, hl, hr, type)
+                for orig_x, orig_y, interp, hl, hr, k_type in original_keys_for_fcurve: # Unpack type
+                    segment_idx = find_segment(orig_x, original_segments)
+                    new_x = orig_x # Default
 
-                fcurve.update()
+                    if original_segments and current_segments: # Check lists aren't empty
+                        if segment_idx == 'before':
+                            offset = current_segments[0][0] - original_segments[0][0]
+                            new_x = orig_x + offset
+                        elif segment_idx == 'after':
+                            offset = current_segments[-1][1] - original_segments[-1][1]
+                            new_x = orig_x + offset
+                        elif isinstance(segment_idx, int):
+                            if 0 <= segment_idx < len(original_segments): # Bounds check
+                                orig_start, orig_end = original_segments[segment_idx]
+                                curr_start, curr_end = current_segments[segment_idx]
+                                orig_length = orig_end - orig_start
+
+                                if abs(orig_length) < 0.0001:
+                                    new_x = curr_start # Snap keys in zero-length segments to start
+                                else:
+                                    position_in_segment = (orig_x - orig_start) / float(orig_length)
+                                    curr_length = curr_end - curr_start
+                                    new_x = curr_start + (position_in_segment * curr_length)
+
+                    # Append calculated key including type
+                    calculated_new_keys.append((new_x, orig_y, interp, copy.deepcopy(hl), copy.deepcopy(hr), k_type))
+
+
+                # --- Apply Snapping and Merging (Handles Type) ---
+                final_keys_to_insert = {} # Use dict {frame: (x, y, interp, hl, hr, type)}
+
+                if snap_frames:
+                    temp_grouped_keys = defaultdict(list)
+                    # Group by rounded frame, store full calculated data
+                    for calc_x, y, interp, hl, hr, k_type in calculated_new_keys:
+                        rounded_x = round(calc_x)
+                        temp_grouped_keys[rounded_x].append((calc_x, y, interp, hl, hr, k_type))
+
+                    for frame, keys_at_frame in temp_grouped_keys.items():
+                        # Merge strategy: Keep the one whose calculated X was closest to the target frame
+                        keys_at_frame.sort(key=lambda k: abs(k[0] - frame))
+                        best_key_data = keys_at_frame[0]
+                        # Store using the rounded frame, but keep full data from the best key
+                        final_keys_to_insert[frame] = (frame, best_key_data[1], best_key_data[2], best_key_data[3], best_key_data[4], best_key_data[5]) # Include type
+                else:
+                     # No snapping, use calculated keys directly. Dict handles exact float duplicates.
+                     for calc_x, y, interp, hl, hr, k_type in calculated_new_keys:
+                          final_keys_to_insert[calc_x] = (calc_x, y, interp, hl, hr, k_type) # Include type
+
+
+                # --- 3c. Apply Updated Keyframes for this F-Curve ---
+                # Clear existing keyframes first
+                try:
+                    while len(fcurve.keyframe_points) > 0:
+                         fcurve.keyframe_points.remove(fcurve.keyframe_points[0], fast=True)
+                except ReferenceError:
+                     print(f"Warning: Could not clear keyframes for {key} in {obj_name} (during apply phase). Skipping update.")
+                     continue # Skip inserting if clearing failed
+
+
+                # Insert the final set of keys, sorted by frame
+                if not final_keys_to_insert:
+                     # Ensure fcurve is updated even if empty now
+                     fcurve.update()
+                     continue
+
+                final_sorted_keys = sorted(final_keys_to_insert.values(), key=lambda k: k[0])
+
+                # --- Batch insert? No direct batch insert with all properties ---
+                # --- Inserting one by one ---
+                for x, y, interp, hl, hr, k_type in final_sorted_keys: # Unpack type
+                    try:
+                        kp = fcurve.keyframe_points.insert(x, y, options={'NEEDED', 'FAST'})
+                        kp.interpolation = interp
+                        kp.handle_left = hl # Already deep copied
+                        kp.handle_right = hr # Already deep copied
+                        kp.type = k_type # Restore type
+                    except Exception as e:
+                        print(f"Error inserting final keyframe at {x} for {key} in {obj_name}: {e}")
+
+                fcurve.update() # Update fcurve after all points are inserted
+
+        # --- End of Object Loop ---
+
+        # Optional: Force UI redraw if needed, though fcurve.update() often suffices
+        # context.view_layer.update()
+        # for area in context.screen.areas:
+        #      if area.type == 'DOPESHEET_EDITOR':
+        #           area.tag_redraw()
+
+        #perf_end_time = time.time()
+        #print(f"Process Retiming took: {perf_end_time - perf_start_time:.4f} seconds") # Optional performance print
+
 
     def modal(self, context, event):
         wm = context.window_manager
+        op_context = 'INVOKE_DEFAULT'
+
         if not wm.retimer_active:
-            self.cancel(context)
+            self.cancel_modal(context)
+            # print("Retiming stopped externally.") # Less verbose
             return {'CANCELLED'}
-        if event.type == 'ESC':
-            # Restore original keyframes on cancel
-            self.restore_original_keyframes(context)
-            wm.retimer_active = False
-            self.cancel(context)
+
+        if event.type == 'ESC' and event.value == 'PRESS':
+            # print("ESC pressed, cancelling retiming.") # Less verbose
+            bpy.ops.animation_retimer.cancel_retiming(op_context)
             return {'CANCELLED'}
+
+        if (event.type == 'RET' or event.type == 'NUMPAD_ENTER') and event.value == 'PRESS':
+            # print("Enter pressed, applying retiming.") # Less verbose
+            bpy.ops.animation_retimer.apply_retiming(op_context)
+            return {'CANCELLED'}
+
         if event.type == 'TIMER':
-            self.process_retiming(context)
+            try:
+                 self.process_retiming(context)
+            except Exception as e:
+                 print(f"Error during process_retiming: {e}")
+                 import traceback
+                 traceback.print_exc()
+                 # Stop the timer and cancel on error to prevent spamming
+                 self.cancel_modal(context)
+                 wm.retimer_active = False # Ensure state is reset
+                 context.area.tag_redraw() # Update UI
+                 self.report({'ERROR'}, "Error during update, retiming cancelled.")
+                 return {'CANCELLED'}
+
         return {'PASS_THROUGH'}
 
-    def restore_original_keyframes(self, context):
-        obj = context.object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            return
-
-        action = obj.animation_data.action
-        for fcurve in action.fcurves:
-            # Store current keyframes
-            orig_keyframes = retimer_data["original_keyframes"].get(fcurve.data_path, [])
-            
-            # Clear existing keyframes
-            while len(fcurve.keyframe_points) > 0:
-                fcurve.keyframe_points.remove(fcurve.keyframe_points[0])
-            
-            # Restore original keyframes
-            for x, y in orig_keyframes:
-                kp = fcurve.keyframe_points.insert(x, y)
-            
-            fcurve.update()
 
     def execute(self, context):
         wm = context.window_manager
+        scene = context.scene
+        op_context = 'INVOKE_DEFAULT'
+
         if not wm.retimer_active:
-            markers = get_ordered_markers(context.scene)
+            # --- STARTING RETIMING ---
+            # print("Starting retiming...") # Less verbose
+            if not scene:
+                 self.report({'ERROR'}, "No active scene.")
+                 return {'CANCELLED'}
+            markers = get_ordered_markers(scene)
             if len(markers) < 2:
-                self.report({'ERROR'}, "Add at least 2 markers first!")
+                self.report({'ERROR'}, "Add at least 2 'RT_' prefixed markers first!")
                 return {'CANCELLED'}
 
+            selected_objects = [o for o in context.selected_objects if o.animation_data and o.animation_data.action]
+            if not selected_objects:
+                 self.report({'ERROR'}, "No selected objects with animation data found!")
+                 return {'CANCELLED'}
+
+            # Store original marker positions
             retimer_data["original_markers"] = {m.name: m.frame for m in markers}
             retimer_data["original_start"] = markers[0].frame
             retimer_data["original_end"] = markers[-1].frame
             retimer_data["original_segments"] = [
-                (markers[i].frame, markers[i+1].frame) 
+                (markers[i].frame, markers[i+1].frame)
                 for i in range(len(markers)-1)
             ]
 
-            obj = context.object
-            if obj and obj.animation_data and obj.animation_data.action:
-                # Store initial keyframe data before entering modal mode
-                self.store_initial_keyframe_data(obj.animation_data.action)
-                retimer_data["original_keyframes"] = {
-                    fcurve.data_path: [(kp.co.x, kp.co.y) for kp in fcurve.keyframe_points]
-                    for fcurve in obj.animation_data.action.fcurves
-                }
-            else:
-                self.report({'ERROR'}, "No animated object selected!")
-                return {'CANCELLED'}
+            # Store initial keyframes for selected objects
+            retimer_data["objects_temp_keyframe_data"] = {} # Clear/initialize
+            retimer_data["objects_processed"] = [] # Reset processed list
+            success_count = 0
+            for obj in selected_objects:
+                if self.store_initial_keyframe_data_for_object(obj):
+                    retimer_data["objects_processed"].append(obj.name)
+                    success_count += 1
 
-            self._timer = wm.event_timer_add(0.1, window=context.window)
+            if success_count == 0:
+                 self.report({'ERROR'}, "Could not store keyframe data for any selected object.")
+                 retimer_data.clear() # Clear all data if failed
+                 return {'CANCELLED'}
+
+            # Store current marker positions to detect changes
+            self._last_marker_positions = {m.name: m.frame for m in markers}
+
+            # Start modal timer (Increased interval for performance)
+            timer_interval = 0.1 # Seconds (10 updates per second)
+            self._timer = wm.event_timer_add(timer_interval, window=context.window)
             wm.modal_handler_add(self)
             wm.retimer_active = True
+            print(f"Retiming active for objects: {retimer_data['objects_processed']} (Update interval: {timer_interval}s)")
+            context.area.tag_redraw()
             return {'RUNNING_MODAL'}
         else:
-            wm.retimer_active = False
-            self.cancel(context)
+            # --- STOPPING RETIMING (via toggle button) ---
+            # print("Toggle Retime called while active - Applying changes.") # Less verbose
+            bpy.ops.animation_retimer.apply_retiming(op_context)
             return {'FINISHED'}
 
-    def cancel(self, context):
+    def cancel_modal(self, context):
+        """Only cleans up the modal timer"""
         wm = context.window_manager
         if self._timer:
-            wm.event_timer_remove(self._timer)
-        self._timer = None
-        wm.retimer_active = False
+            try:
+                wm.event_timer_remove(self._timer)
+                # print("Modal timer removed.") # Less verbose
+            except ValueError: # Timer might already be removed
+                 # print("Modal timer already removed.") # Less verbose
+                 pass
+            self._timer = None
 
-def make_marker_distinct(marker):
-    """Ensure the marker is visually distinct"""
-    marker.name = f"RT_{marker.frame}"  # Prefix all retime markers
 
-def lock_retiming_markers():
-    """Prevent accidental renaming of retime markers"""
-    for marker in bpy.context.scene.timeline_markers:
-        if marker.name.startswith("RT_"):
-            marker.select = False  # Prevent accidental selection
-            marker.color = 'RETIME'  # Set color for retime markers
+class ANIMATION_RETIMER_OT_ApplyRetiming(bpy.types.Operator):
+    """Apply the current retiming changes permanently"""
+    bl_idname = "animation_retimer.apply_retiming"
+    bl_label = "Apply Retiming"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.window_manager.retimer_active
+
+    def execute(self, context):
+        wm = context.window_manager
+        # print("Applying retiming changes.") # Less verbose
+        wm.retimer_active = False # Stop modal loop FIRST
+
+        # Clear temporary data
+        retimer_data.pop("objects_temp_keyframe_data", None)
+        retimer_data.pop("objects_processed", None)
+        retimer_data.pop("original_markers", None)
+        retimer_data.pop("original_segments", None)
+
+        context.area.tag_redraw()
+        self.report({'INFO'}, "Retiming applied.")
+        return {'FINISHED'}
+
+class ANIMATION_RETIMER_OT_CancelRetiming(bpy.types.Operator):
+    """Discard all retiming changes since 'Start Retiming' was pressed"""
+    bl_idname = "animation_retimer.cancel_retiming"
+    bl_label = "Discard Changes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        wm = context.window_manager
+        scene = context.scene
+
+        objects_to_restore = retimer_data.get("objects_processed", [])
+        original_marker_positions = retimer_data.get("original_markers", {})
+        stored_keyframe_data_exists = "objects_temp_keyframe_data" in retimer_data and \
+                                     retimer_data["objects_temp_keyframe_data"]
+
+        if not objects_to_restore and not original_marker_positions and not stored_keyframe_data_exists:
+             self.report({'WARNING'}, "No retiming data found to cancel/discard.")
+             if wm.retimer_active: wm.retimer_active = False # Ensure inactive
+             context.area.tag_redraw()
+             return {'CANCELLED'}
+
+        # print("Cancelling retiming and restoring original state...") # Less verbose
+        was_active = wm.retimer_active
+        wm.retimer_active = False # Stop modal loop FIRST
+
+        # --- Restore Keyframes (using the dedicated restore function now) ---
+        if stored_keyframe_data_exists:
+            # print(f"Objects to restore keyframes for: {objects_to_restore}") # Less verbose
+            # Need an instance of the RetimeMarker operator to call its restore method? No, moved logic.
+            # Create temporary instance? No, call directly if possible.
+            # Let's reuse the restore method logic directly here or call it if accessible.
+            # Calling requires an instance... let's reuse the logic for safety.
+
+            restore_instance = ANIMATION_RETIMER_OT_RetimeMarker() # Temporary instance ok? Seems ok.
+            for obj_name in objects_to_restore:
+                obj = bpy.data.objects.get(obj_name)
+                if obj:
+                    # Use the restore method from the class
+                    restore_instance.restore_from_original_for_object(obj)
+                else:
+                    print(f"Skipping restore for missing object: {obj_name}")
+        # else: print("No stored keyframe data to restore.") # Less verbose
+
+
+        # --- Restore Markers ---
+        if original_marker_positions:
+            # print("Restoring marker positions...") # Less verbose
+            if scene and scene.timeline_markers: # Check scene and markers exist
+                current_markers = scene.timeline_markers
+                markers_to_remove = []
+                processed_marker_names = set()
+
+                for name, frame in original_marker_positions.items():
+                    if name in current_markers:
+                        current_markers[name].frame = frame
+                        processed_marker_names.add(name)
+                    # else: print(f"  Original marker {name} not found, cannot restore.") # Less verbose
+
+                for marker in current_markers:
+                     if marker.name.startswith("RT_") and marker.name not in processed_marker_names:
+                          markers_to_remove.append(marker)
+                          # print(f"  Removing marker potentially added during retiming: {marker.name}") # Less verbose
+
+                for marker in markers_to_remove:
+                     try: current_markers.remove(marker)
+                     except (KeyError, ReferenceError): pass # Ignore if already gone
+
+        # else: print("No original marker positions stored to restore.") # Less verbose
+
+
+        # --- Clean up global data ---
+        retimer_data.pop("objects_temp_keyframe_data", None)
+        retimer_data.pop("objects_processed", None)
+        retimer_data.pop("original_markers", None)
+        retimer_data.pop("original_segments", None)
+
+        context.area.tag_redraw()
+        self.report({'INFO'}, "Retiming cancelled, changes discarded.")
+        return {'FINISHED'}
+
+
+# --- Other Operators ---
+
+class ANIMATION_RETIMER_OT_DeleteMarker(bpy.types.Operator):
+    """Delete the selected retiming marker (Disabled during active Retime)"""
+    bl_idname = "animation_retimer.delete_marker"
+    bl_label = "Delete Retiming Marker"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    marker_name: bpy.props.StringProperty(name="Marker Name")
+
+    @classmethod
+    def poll(cls, context):
+         return not context.window_manager.retimer_active
+
+    def execute(self, context):
+        if context.window_manager.retimer_active: # Redundant check due to poll
+             self.report({'ERROR'}, "Cannot delete markers while retiming is active.")
+             return {'CANCELLED'}
+        if not context.scene or not context.scene.timeline_markers:
+             self.report({'ERROR'}, "No scene or timeline markers found.")
+             return {'CANCELLED'}
+
+        markers = context.scene.timeline_markers
+        if self.marker_name in markers:
+            try:
+                markers.remove(markers[self.marker_name])
+                retimer_data.get("original_markers", {}).pop(self.marker_name, None)
+                # self.report({'INFO'}, f"Deleted marker: {self.marker_name}") # Less verbose
+            except (KeyError, ReferenceError):
+                 self.report({'WARNING'}, f"Marker '{self.marker_name}' could not be removed.")
+                 return {'CANCELLED'}
+        else:
+             self.report({'WARNING'}, f"Marker '{self.marker_name}' not found.")
+             return {'CANCELLED'}
+        return {'FINISHED'}
+
+class ANIMATION_RETIMER_OT_ClearMarkers(bpy.types.Operator):
+    """Remove all retiming markers (RT_ prefix) (Disabled during active Retime)"""
+    bl_idname = "animation_retimer.clear_markers"
+    bl_label = "Clear All Retiming Markers"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+         return not context.window_manager.retimer_active
+
+    def execute(self, context):
+        if context.window_manager.retimer_active: # Redundant check
+             self.report({'ERROR'}, "Cannot clear markers while retiming is active.")
+             return {'CANCELLED'}
+        if not context.scene or not context.scene.timeline_markers:
+             self.report({'ERROR'}, "No scene or timeline markers found.")
+             return {'CANCELLED'}
+
+        markers = context.scene.timeline_markers
+        to_remove = [m for m in markers if m.name.startswith("RT_")]
+        if not to_remove:
+             self.report({'INFO'}, "No 'RT_' markers found to clear.")
+             return {'CANCELLED'}
+
+        count = len(to_remove)
+        for marker in to_remove:
+            try: markers.remove(marker)
+            except (KeyError, ReferenceError): pass
+
+        retimer_data.pop("original_markers", None)
+        self.report({'INFO'}, f"Cleared {count} 'RT_' markers.")
+        return {'FINISHED'}
+
+
+class ANIMATION_RETIMER_OT_SelectMarker(bpy.types.Operator):
+    """Jump to the selected marker's position in the timeline"""
+    bl_idname = "animation_retimer.select_marker"
+    bl_label = "Select Retiming Marker"
+    bl_options = {'REGISTER'} # No UNDO needed
+
+    marker_name: bpy.props.StringProperty(name="Marker Name")
+
+    def execute(self, context):
+        if not context.scene or not context.scene.timeline_markers:
+             self.report({'ERROR'}, "No scene or timeline markers found.")
+             return {'CANCELLED'}
+        scene = context.scene
+        markers = scene.timeline_markers
+        if self.marker_name in markers:
+            marker = markers[self.marker_name]
+            try:
+                 scene.frame_set(marker.frame)
+            except Exception as e:
+                 self.report({'ERROR'}, f"Could not set frame: {e}")
+                 return {'CANCELLED'}
+        else:
+             self.report({'WARNING'}, f"Marker '{self.marker_name}' not found.")
+             return {'CANCELLED'}
+        return {'FINISHED'}
+
+# --- Panel ---
 
 class ANIMATION_RETIMER_PT_Panel(bpy.types.Panel):
-    bl_label = "Animation Retimer"
+    bl_label = "Animation Retimer (Multi)"
     bl_idname = "ANIMATION_RETIMER_PT_Panel"
     bl_space_type = 'DOPESHEET_EDITOR'
     bl_region_type = 'UI'
@@ -305,214 +682,170 @@ class ANIMATION_RETIMER_PT_Panel(bpy.types.Panel):
         layout = self.layout
         wm = context.window_manager
         scene = context.scene
-        
-        # Main action buttons at the top
-        layout.separator()
+        if not scene: # Handle case where scene might not be available
+             layout.label(text="No active scene.", icon='ERROR')
+             return
+
+        # --- Main Controls ---
+        col = layout.column(align=True)
         if wm.retimer_active:
-            row = layout.row()
+            row = col.row(align=True)
             row.operator("animation_retimer.apply_retiming", text="Apply Changes", icon='CHECKMARK')
             row.operator("animation_retimer.cancel_retiming", text="Discard Changes", icon='X')
+            col.label(text="Retiming Active...", icon='INFO')
+            processed_objs = retimer_data.get("objects_processed", [])
+            if processed_objs:
+                 box = col.box()
+                 box.label(text=f"Processing ({len(processed_objs)}):")
+                 limit = 3
+                 for i, name in enumerate(processed_objs):
+                      if i >= limit: box.label(text=f"...and {len(processed_objs) - limit} more"); break
+                      box.label(text=f"- {name}", icon='OBJECT_DATA')
         else:
-            layout.operator("animation_retimer.retime_marker", text="Start Retiming", icon='PLAY')
-            
+            can_start = len(get_ordered_markers(scene)) >= 2
+            row = col.row()
+            row.enabled = can_start
+            row.operator("animation_retimer.retime_marker", text="Start Retiming", icon='PLAY')
+            if not can_start:
+                 col.label(text="Add >= 2 'RT_' markers", icon='ERROR')
+
         layout.separator()
-        
-        # Marker management controls
+
+        # --- Marker Management ---
         row = layout.row(align=True)
+        # Use poll status of operators to implicitly disable row if needed
+        # row.enabled = not wm.retimer_active # Not strictly needed due to operator polls
         row.operator("animation_retimer.add_marker", text="Add Marker", icon='ADD')
         row.operator("animation_retimer.clear_markers", text="Clear All", icon='TRASH')
-        
-        # Segments information (when active)
+
+        layout.separator()
+        layout.prop(wm, "retimer_snap_frames") # Snap option
+
+        # --- Segments Info (when active) ---
         if wm.retimer_active:
             markers = get_ordered_markers(scene)
             if len(markers) >= 2:
                 layout.separator()
                 box = layout.box()
                 box.label(text="Segment Status:", icon='NLA')
-                
-                has_collapsed = False
-                current_segments = [
-                    (markers[i].frame, markers[i+1].frame) 
-                    for i in range(len(markers)-1)
-                ]
-                
-                for i, (curr_start, curr_end) in enumerate(current_segments):
-                    row = box.row()
-                    orig_start, orig_end = retimer_data["original_segments"][i]
-                    orig_length = orig_end - orig_start
-                    curr_length = curr_end - curr_start
-                    
-                    if orig_length > 0 and curr_length > 0:
-                        ratio = curr_length / orig_length
-                        speed_text = f"{ratio:.1f}x"
-                        if ratio > 1:
-                            icon = 'TRIA_DOWN'
+                original_segments_ui = retimer_data.get("original_segments", [])
+                original_markers_map = retimer_data.get("original_markers",{})
+                if not original_markers_map or not original_segments_ui:
+                     box.label(text="Original data missing.", icon='ERROR')
+                     return # Exit draw section if data is bad
+
+                valid_current_markers = {name: m for name, m in zip(original_markers_map.keys(), markers) if name in original_markers_map}
+                sorted_marker_names = sorted(valid_current_markers.keys(), key=lambda name: original_markers_map[name])
+
+                current_segments_ui = []
+                valid_segment_count = 0
+                for i in range(len(sorted_marker_names) - 1):
+                     name1, name2 = sorted_marker_names[i], sorted_marker_names[i+1]
+                     frame1 = scene.timeline_markers.get(name1)
+                     frame2 = scene.timeline_markers.get(name2)
+                     if frame1 is not None and frame2 is not None:
+                          current_segments_ui.append((frame1.frame, frame2.frame))
+                          valid_segment_count += 1
+                     else:
+                          current_segments_ui.append(None) # Placeholder
+
+                if valid_segment_count == len(original_segments_ui):
+                    has_collapsed = False
+                    for i, current_seg in enumerate(current_segments_ui):
+                        if current_seg is None: continue # Skip already handled missing markers
+                        row = box.row()
+                        curr_start, curr_end = current_seg
+                        orig_start, orig_end = original_segments_ui[i]
+                        orig_length = orig_end - orig_start
+                        curr_length = curr_end - curr_start
+                        icon = 'RIGHTARROW' # Default icon
+                        if curr_start > curr_end:
+                            speed_text = "Collapsed/Inverted"; icon = 'ERROR'; has_collapsed = True
+                        elif abs(orig_length) < 0.0001:
+                            speed_text = "From Zero Length"; icon='INFO'
                         else:
-                            icon = 'TRIA_UP'
-                    else:
-                        speed_text = "Collapsed"
-                        icon = 'INFO'
-                        has_collapsed = True
-                    
-                    row.label(text=f"Segment {i+1}: {speed_text}", icon=icon)
-        
-        # Marker details toggle and list at the bottom
+                            ratio = curr_length / float(orig_length)
+                            speed_text = f"{ratio:.2f}x Speed"
+                            if ratio > 1: icon = 'TRIA_DOWN'
+                            elif ratio < 1: icon = 'TRIA_UP'
+                        row.label(text=f"Seg {i+1} [{orig_start}-{orig_end} -> {curr_start}-{curr_end}]: {speed_text}", icon=icon)
+                    if has_collapsed: box.label(text="Collapsed segments!", icon='ERROR')
+                else:
+                     box.label(text="Segment mismatch (Markers missing?)", icon='QUESTION')
+
+
+        # --- Marker Details List ---
         layout.separator()
-        layout.prop(wm, "show_retime_markers", text="Show Marker Details", toggle=True)
-        
+        icon = 'TRIA_DOWN' if wm.show_retime_markers else 'TRIA_RIGHT'
+        layout.prop(wm, "show_retime_markers", text="Show Marker Details", toggle=True, icon=icon, emboss=False)
+
         if wm.show_retime_markers:
             box = layout.box()
-            box.label(text="Marker Management:", icon='MARKER')
-            markers = sorted([m for m in scene.timeline_markers if m.name.startswith("RT_")], 
-                           key=lambda m: m.frame)
-            
-            for marker in markers:
-                row = box.row(align=True)
-                row.operator("animation_retimer.select_marker", 
-                           text="", icon='RESTRICT_SELECT_OFF').marker_name = marker.name
-                row.prop(marker, "frame", text=marker.name)
-                row.operator("animation_retimer.delete_marker", 
-                           text="", icon='X').marker_name = marker.name
+            markers = get_ordered_markers(scene)
+            if not markers: box.label(text="No 'RT_' markers found.", icon='INFO')
+            else:
+                for marker in markers:
+                    row = box.row(align=True); row.scale_y = 0.9
+                    # Jump Button
+                    op_jump = row.operator("animation_retimer.select_marker", text="", icon='RESTRICT_SELECT_OFF')
+                    op_jump.marker_name = marker.name
+                    # Name/Frame Property (disable editing during retime)
+                    row_prop = row.row() # Sub-row to disable only the prop
+                    row_prop.enabled = not wm.retimer_active
+                    row_prop.prop(marker, "frame", text=marker.name)
+                    # Delete Button (disabled via poll)
+                    op_del = row.operator("animation_retimer.delete_marker", text="", icon='X', emboss=False)
+                    op_del.marker_name = marker.name
 
-class ANIMATION_RETIMER_OT_DeleteMarker(bpy.types.Operator):
-    """Delete the selected retiming marker
-    
-    Removes a specific marker from the timeline.
-    This will affect how the animation is retimed if the retiming process is active"""
-    bl_idname = "animation_retimer.delete_marker"
-    bl_label = "Delete Retiming Marker"
-    bl_options = {'REGISTER', 'UNDO'}  # Added UNDO support
-    
-    marker_name: bpy.props.StringProperty()
 
-    def execute(self, context):
-        markers = context.scene.timeline_markers
-        if self.marker_name in markers:
-            markers.remove(markers[self.marker_name])
-            if self.marker_name in retimer_data["original_markers"]:
-                del retimer_data["original_markers"][self.marker_name]
-        return {'FINISHED'}
-
-class ANIMATION_RETIMER_OT_ClearMarkers(bpy.types.Operator):
-    """Remove all retiming markers from the timeline
-    
-    Clears all RT_ prefixed markers, effectively resetting the retiming setup.
-    This operation cannot be undone"""
-    bl_idname = "animation_retimer.clear_markers"
-    bl_label = "Clear All Retiming Markers"
-    bl_options = {'REGISTER', 'UNDO'}  # Added UNDO support
-
-    def execute(self, context):
-        markers = context.scene.timeline_markers
-        to_remove = [m for m in markers if m.name.startswith("RT_")]
-        
-        for marker in to_remove:
-            markers.remove(marker)
-
-        retimer_data["original_markers"].clear()
-        return {'FINISHED'}
-
-class ANIMATION_RETIMER_OT_SelectMarker(bpy.types.Operator):
-    """Jump to the selected marker's position in the timeline
-    
-    Moves the timeline cursor to the frame where this marker is located.
-    Useful for quick navigation between retiming points"""
-    bl_idname = "animation_retimer.select_marker"
-    bl_label = "Select Retiming Marker"
-    bl_options = {'REGISTER', 'UNDO'}  # Added UNDO support
-    
-    marker_name: bpy.props.StringProperty()
-
-    def execute(self, context):
-        scene = context.scene
-        markers = scene.timeline_markers
-
-        if self.marker_name in markers:
-            marker = markers[self.marker_name]
-            scene.frame_current = marker.frame
-
-        return {'FINISHED'}
-
-class ANIMATION_RETIMER_OT_ApplyRetiming(bpy.types.Operator):
-    """Apply the current retiming changes
-    
-    Finalizes the current retiming operation.
-    This will make the timing changes permanent"""
-    bl_idname = "animation_retimer.apply_retiming"
-    bl_label = "Apply Retiming"
-    bl_options = {'REGISTER', 'UNDO'}  # Added UNDO support
-    
-    def execute(self, context):
-        context.window_manager.retimer_active = False
-        return {'FINISHED'}
-
-class ANIMATION_RETIMER_OT_CancelRetiming(bpy.types.Operator):
-    """Discard all retiming changes
-    
-    Reverts the animation back to its original timing.
-    All marker positions will be reset to their original locations"""
-    bl_idname = "animation_retimer.cancel_retiming"
-    bl_label = "Discard Changes"
-    bl_options = {'REGISTER', 'UNDO'}  # Added UNDO support
-    
-    def execute(self, context):
-        obj = context.object
-        if obj and obj.animation_data and obj.animation_data.action:
-            action = obj.animation_data.action
-            
-            if "_temp_keyframe_data" not in retimer_data:
-                self.report({'ERROR'}, "No stored keyframe data found")
-                return {'CANCELLED'}
-            
-            for fcurve in action.fcurves:
-                key = (fcurve.data_path, fcurve.array_index)
-                if key in retimer_data["_temp_keyframe_data"]:
-                    while len(fcurve.keyframe_points) > 0:
-                        fcurve.keyframe_points.remove(fcurve.keyframe_points[0])
-                    
-                    for x, y, interp, hl, hr in retimer_data["_temp_keyframe_data"][key]:
-                        kp = fcurve.keyframe_points.insert(x, y)
-                        kp.interpolation = interp
-                        kp.handle_left = copy.deepcopy(hl)
-                        kp.handle_right = copy.deepcopy(hr)
-                
-                fcurve.update()
-        
-        markers = get_ordered_markers(context.scene)
-        for m in markers:
-            if m.name in retimer_data["original_markers"]:
-                m.frame = retimer_data["original_markers"][m.name]
-        
-        context.window_manager.retimer_active = False
-        return {'FINISHED'}
+# --- Registration ---
 
 classes = (
     ANIMATION_RETIMER_OT_AddMarker,
     ANIMATION_RETIMER_OT_RetimeMarker,
-    ANIMATION_RETIMER_PT_Panel,
+    ANIMATION_RETIMER_OT_ApplyRetiming,
+    ANIMATION_RETIMER_OT_CancelRetiming,
     ANIMATION_RETIMER_OT_DeleteMarker,
     ANIMATION_RETIMER_OT_ClearMarkers,
     ANIMATION_RETIMER_OT_SelectMarker,
-    ANIMATION_RETIMER_OT_ApplyRetiming,
-    ANIMATION_RETIMER_OT_CancelRetiming
+    ANIMATION_RETIMER_PT_Panel,
 )
 
 def register():
     for cls in classes:
-        bpy.utils.register_class(cls)
-    bpy.types.WindowManager.retimer_active = bpy.props.BoolProperty(default=False)
-    bpy.types.WindowManager.retimer_snap_frames = bpy.props.BoolProperty(
-        name="Snap to Whole Frames",
-        default=True
-    )
-    bpy.types.WindowManager.show_retime_markers = bpy.props.BoolProperty(name="Show Markers List", default=True)
+        try: bpy.utils.register_class(cls)
+        except ValueError: pass # Already registered
+
+    props = {
+        "retimer_active": bpy.props.BoolProperty(name="Retimer Active", default=False),
+        "retimer_snap_frames": bpy.props.BoolProperty(name="Snap Keys to Whole Frames", default=True),
+        "show_retime_markers": bpy.props.BoolProperty(name="Show Markers List", default=True)
+    }
+    for name, prop in props.items():
+         if not hasattr(bpy.types.WindowManager, name):
+              setattr(bpy.types.WindowManager, name, prop)
+
+    print("Animation Retimer (Multi-Object) Registered")
+
 
 def unregister():
+    print("Unregistering Animation Retimer (Multi-Object)...")
+    retimer_data.clear() # Clear data on unregister
+
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
-    del bpy.types.WindowManager.retimer_active
-    del bpy.types.WindowManager.retimer_snap_frames
-    del bpy.types.WindowManager.show_retime_markers
+        try: bpy.utils.unregister_class(cls)
+        except RuntimeError: pass # Not registered
+
+    props_to_delete = ["retimer_active", "retimer_snap_frames", "show_retime_markers"]
+    for prop in props_to_delete:
+        if hasattr(bpy.types.WindowManager, prop):
+            try: delattr(bpy.types.WindowManager, prop)
+            except Exception: pass
+
+    print("Animation Retimer (Multi-Object) Unregistered")
+
 
 if __name__ == "__main__":
+    try: unregister()
+    except Exception: pass
     register()
