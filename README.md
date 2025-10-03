@@ -74,3 +74,6 @@ Contributions are welcome! If you’d like to suggest improvements, report bugs,
 
 This addon is licensed under the **GNU General Public License v3**.
 
+## [Tutorial](https://youtu.be/lfWiZvuM_oc)
+
+
